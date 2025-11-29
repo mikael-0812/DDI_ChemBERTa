@@ -17,4 +17,4 @@ data_test['d2_smiles'] = data_test['d2'].map(id2smiles)
 data_train.to_csv("../dataset/inductive_data/train_f.csv", index=False)
 data_test.to_csv("../dataset/inductive_data/test_f.csv", index=False)
 
-
+data_train =

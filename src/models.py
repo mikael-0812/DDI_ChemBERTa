@@ -12,59 +12,68 @@ from typing import List, Optional
 # ==========================
 
 class DDIDataset(Dataset):
-    """
-    CSV format:
-    SMILES1, SMILES2, Interaction_class, NegativeSampleSMILES
-
-    Ở phiên bản này ta dùng SMILES1, SMILES2, Interaction_class.
-    SMILES_NEG có thể dùng sau cho hard negative.
-    """
-    def __init__(self, csv_path: str):
+    def __init__(self, csv_path, id_to_smiles: dict):
         df = pd.read_csv(csv_path)
-        self.smi1 = df["d1_smiles"].astype(str).tolist()
-        self.smi2 = df["d2_smiles"].astype(str).tolist()
+
+        self.d1 = df["d1_smiles"].astype(str).tolist()
+        self.d2 = df["d2_smiles"].astype(str).tolist()
         self.labels = df["type"].astype(int).tolist()
-        # Nếu muốn dùng negative sau:
-        #self.smi_neg = df["NegativeSampleSMILES"].astype(str).tolist()
+        self.neg_raw = df["neg_smiles"].astype(str).tolist()
+
+        self.id_to_smiles = id_to_smiles  # dict: DrugBankID -> SMILES
 
     def __len__(self):
-        return len(self.smi1)
+        return len(self.d1)
 
     def __getitem__(self, idx):
+
+        drug1 = self.d1[idx]
+        drug2 = self.d2[idx]
+        label = self.labels[idx]
+        neg_field = self.neg_raw[idx]  # VD: "DB06725$t"
+
+        # tách "DB06725" và "$t"
+        neg_id, flag = neg_field.split("$")
+        flag = flag.lower()
+
+        # xác định negative ghép với đâu
+        if flag == "h":   # head → drug1
+            neg_pair_1 = self.id_to_smiles[drug1]
+            neg_pair_2 = self.id_to_smiles[neg_id]
+        else:             # flag == "t": tail → drug2
+            neg_pair_1 = self.id_to_smiles[neg_id]
+            neg_pair_2 = self.id_to_smiles[drug2]
+
         return {
-            "smiles1": self.smi1[idx],
-            "smiles2": self.smi2[idx],
-            "label": self.labels[idx],
-            # "smiles_neg": self.smi_neg[idx],
+            "smiles1": self.id_to_smiles[drug1],
+            "smiles2": self.id_to_smiles[drug2],
+            "label": label,
+
+            # negative pair (always: left drug, negative drug)
+            "neg1": neg_pair_1,
+            "neg2": neg_pair_2,
         }
 
 
-def collate_ddi(batch, tokenizer, max_length: int = 256, device: str = "cpu"):
-    smiles1 = [b["smiles1"] for b in batch]
-    smiles2 = [b["smiles2"] for b in batch]
-    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long)
+def collate_ddi(batch, tokenizer, max_length=256, device="cpu"):
+    smi1 = [b["smiles1"] for b in batch]
+    smi2 = [b["smiles2"] for b in batch]
+    neg1 = [b["neg1"]    for b in batch]
+    neg2 = [b["neg2"]    for b in batch]
 
-    enc1 = tokenizer(
-        smiles1,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    enc2 = tokenizer(
-        smiles2,
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
+    labels = torch.tensor([b["label"] for b in batch], dtype=torch.long).to(device)
 
-    # Move to device
-    enc1 = {k: v.to(device) for k, v in enc1.items()}
-    enc2 = {k: v.to(device) for k, v in enc2.items()}
-    labels = labels.to(device)
+    enc1 = tokenizer(smi1, padding=True, truncation=True,
+                     max_length=max_length, return_tensors="pt").to(device)
+    enc2 = tokenizer(smi2, padding=True, truncation=True,
+                     max_length=max_length, return_tensors="pt").to(device)
 
-    return enc1, enc2, labels
+    enc_neg1 = tokenizer(neg1, padding=True, truncation=True,
+                          max_length=max_length, return_tensors="pt").to(device)
+    enc_neg2 = tokenizer(neg2, padding=True, truncation=True,
+                          max_length=max_length, return_tensors="pt").to(device)
+
+    return enc1, enc2, enc_neg1, enc_neg2, labels
 
 
 # ==========================
