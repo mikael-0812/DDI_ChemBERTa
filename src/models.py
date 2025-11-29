@@ -179,13 +179,13 @@ class SmilesOnlyDDIModel(nn.Module):
     def __init__(
         self,
         model_name: str,
+        lambda_supcon: float,
         num_classes: int = 86,
         subfolder: Optional[str] = None,
         d_model: int = 512,
         n_heads: int = 8,
         dropout: float = 0.1,
         freeze_encoder: bool = True,
-        lambda_supcon: float = 0.1,
     ):
         super().__init__()
 
@@ -262,7 +262,7 @@ class SmilesOnlyDDIModel(nn.Module):
         # CE loss
         ce_loss = F.cross_entropy(logits, labels)
 
-        k = 16  # smaller k greatly speeds up training
+        k = 16
 
         all_motifs = []
         all_motif_labels = []
