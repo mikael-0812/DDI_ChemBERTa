@@ -6,19 +6,19 @@ import pandas as pd
 from transformers import AutoTokenizer, RobertaModel
 from typing import List, Optional
 
-
-# ==========================
-# Dataset skeleton
-# ==========================
-
 class DDIDataset(Dataset):
+    """
+    Tạo cặp negative sample :
+    dataset : d1 - d2 - type - split($h : head and $t : tail)
+    Get smile for each drug by dictionary ('id_to_smile')
+    """
     def __init__(self, csv_path, id_to_smiles: dict):
         df = pd.read_csv(csv_path)
 
-        self.d1 = df["d1_smiles"].astype(str).tolist()
-        self.d2 = df["d2_smiles"].astype(str).tolist()
+        self.d1 = df["d1"].astype(str).tolist()
+        self.d2 = df["d2"].astype(str).tolist()
         self.labels = df["type"].astype(int).tolist()
-        self.neg_raw = df["neg_smiles"].astype(str).tolist()
+        self.neg_raw = df["split"].astype(str).tolist()
 
         self.id_to_smiles = id_to_smiles  # dict: DrugBankID -> SMILES
 
@@ -30,17 +30,15 @@ class DDIDataset(Dataset):
         drug1 = self.d1[idx]
         drug2 = self.d2[idx]
         label = self.labels[idx]
-        neg_field = self.neg_raw[idx]  # VD: "DB06725$t"
+        neg_field = self.neg_raw[idx]
 
-        # tách "DB06725" và "$t"
         neg_id, flag = neg_field.split("$")
         flag = flag.lower()
 
-        # xác định negative ghép với đâu
-        if flag == "h":   # head → drug1
+        if flag == "h":   # head : drug1
             neg_pair_1 = self.id_to_smiles[drug1]
             neg_pair_2 = self.id_to_smiles[neg_id]
-        else:             # flag == "t": tail → drug2
+        else:             # flag == "t" -> tail : drug2
             neg_pair_1 = self.id_to_smiles[neg_id]
             neg_pair_2 = self.id_to_smiles[drug2]
 
@@ -49,17 +47,22 @@ class DDIDataset(Dataset):
             "smiles2": self.id_to_smiles[drug2],
             "label": label,
 
-            # negative pair (always: left drug, negative drug)
+            # negative pair (left drug, negative drug)
             "neg1": neg_pair_1,
             "neg2": neg_pair_2,
         }
 
 
-def collate_ddi(batch, tokenizer, max_length=256, device="cpu"):
+def collate_ddi(batch, tokenizer, is_test, device, max_length=256):
+    """
+    :param batch:
+    :param tokenizer: chemBERTa pretrained
+    :param max_length: 256
+    :param device: cpu/gpu
+    :return: tokenizer
+    """
     smi1 = [b["smiles1"] for b in batch]
     smi2 = [b["smiles2"] for b in batch]
-    neg1 = [b["neg1"]    for b in batch]
-    neg2 = [b["neg2"]    for b in batch]
 
     labels = torch.tensor([b["label"] for b in batch], dtype=torch.long).to(device)
 
@@ -67,6 +70,11 @@ def collate_ddi(batch, tokenizer, max_length=256, device="cpu"):
                      max_length=max_length, return_tensors="pt").to(device)
     enc2 = tokenizer(smi2, padding=True, truncation=True,
                      max_length=max_length, return_tensors="pt").to(device)
+    if is_test:
+        return enc1, enc2, labels
+
+    neg1 = [b["neg1"]    for b in batch]
+    neg2 = [b["neg2"]    for b in batch]
 
     enc_neg1 = tokenizer(neg1, padding=True, truncation=True,
                           max_length=max_length, return_tensors="pt").to(device)
@@ -76,15 +84,14 @@ def collate_ddi(batch, tokenizer, max_length=256, device="cpu"):
     return enc1, enc2, enc_neg1, enc_neg2, labels
 
 
-# ==========================
-# Cross-Attention Block
-# ==========================
 
 class CrossAttentionBlock(nn.Module):
     """
-    Một block cross-attention đơn giản:
-    Q từ seq_q, K/V từ seq_kv
-    Có residual + LayerNorm + FFN như Transformer encoder.
+    Cross_Attention nhận Q, K, V từ drug x và drug y
+    Với x, y lần lượt đưa ra x(Q) và y(K, V)
+    Hx <-> Hy
+    Hy <-> Hx
+
     """
     def __init__(self, d_model=512, n_heads=8, dropout=0.1):
         super().__init__()
@@ -99,7 +106,7 @@ class CrossAttentionBlock(nn.Module):
             nn.Linear(d_model, d_model * 4),
             nn.GELU(),
             nn.Linear(d_model * 4, d_model),
-        )
+        ) #Feed Forward
         self.ln2 = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
@@ -111,25 +118,21 @@ class CrossAttentionBlock(nn.Module):
         """
         key_padding_mask = None
         if kv_mask is not None:
-            key_padding_mask = (kv_mask == 0)  # True = pad
+            key_padding_mask = (kv_mask == 0)  # Nếu kv_mask = 1 (không cần padding) ngược lại padding nếu bằng 0
 
         attn_out, attn_weights = self.attn(
-            query=q,
-            key=kv,
+            query=q, # (B, Lq, D)
+            key=kv, # (B, Lk, D)
             value=kv,
             key_padding_mask=key_padding_mask,
             need_weights=True,
-            average_attn_weights=False,  # (B, num_heads, Lq, Lk)
+            average_attn_weights=False,  # (B, num_heads, Lq, Lk) : trọng số attention
         )
         x = self.ln1(q + self.dropout(attn_out))
         ffn_out = self.ffn(x)
         x = self.ln2(x + self.dropout(ffn_out))
         return x, attn_weights
 
-
-# ==========================
-# SupCon cho motif/substructure
-# ==========================
 
 def supervised_contrastive_loss(
     features: torch.Tensor,  # (M, D)
@@ -153,7 +156,7 @@ def supervised_contrastive_loss(
     sim_matrix = torch.matmul(features, features.T) / temperature
 
     # Label mask: positives nếu cùng label, bỏ self
-    labels = labels.view(-1, 1)
+    labels = labels.view(-1, 1) #Chỉ so khớp smiles, nếu thêm graph embedding cần tạo cho smile x và graph x
     mask = torch.eq(labels, labels.T).float().to(device)
     # loại bỏ diagonal (self)
     mask = mask - torch.eye(M, device=device)
@@ -180,11 +183,10 @@ def supervised_contrastive_loss(
     return loss
 
 
-# ==========================
-# Model: SMILES-only DDI + Substructure SupCon
-# ==========================
-
 class SmilesOnlyDDIModel(nn.Module):
+    """
+
+    """
     def __init__(
         self,
         model_name: str,
@@ -218,11 +220,13 @@ class SmilesOnlyDDIModel(nn.Module):
 
         if freeze_encoder:
             for p in self.encoder.parameters():
-                p.requires_grad = False
+                p.requires_grad = False #đóng băng encoder, chỉ train cross-attn + classifier + SupCon
 
-        self.cross_ab = CrossAttentionBlock(d_model, n_heads, dropout)
-        self.cross_ba = CrossAttentionBlock(d_model, n_heads, dropout)
+        self.cross_ab = CrossAttentionBlock(d_model, n_heads, dropout) #Hx_att
+        self.cross_ba = CrossAttentionBlock(d_model, n_heads, dropout) #Hy_att
 
+        #input vector : [z1, z2, z1*z2, |z1−z2|]
+        #MLP (Linear -> GELU -> Drop -> Linear) to predict 86 classes
         self.classifier = nn.Sequential(
             nn.Linear(d_model * 4, d_model * 2),
             nn.GELU(),
@@ -230,7 +234,7 @@ class SmilesOnlyDDIModel(nn.Module):
             nn.Linear(d_model * 2, num_classes),
         )
 
-        self.lambda_supcon = lambda_supcon
+        self.lambda_supcon = lambda_supcon #Điều chỉnh CE loss + SupCon
         self.d_model = d_model
 
     def mean_pool(self, x, mask):
@@ -239,16 +243,16 @@ class SmilesOnlyDDIModel(nn.Module):
         """
         mask = mask.unsqueeze(-1).float()  # (B, L, 1)
         x = x * mask
-        return x.sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        return x.sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6) #Đưa Hx, Hy qua mean_pooling
 
     def forward(self, enc1, enc2, labels=None):
         #Encode SMILES
         out1 = self.encoder(**enc1)
         out2 = self.encoder(**enc2)
 
-        H1 = out1.last_hidden_state  # (B, L1, D)
+        H1 = out1.last_hidden_state  # (B, L1, D) : output layer cuối
         H2 = out2.last_hidden_state  # (B, L2, D)
-        m1 = enc1["attention_mask"]  # (B, L1)
+        m1 = enc1["attention_mask"]  # (B, L1) : mask cho padding (đánh dấu padding)
         m2 = enc2["attention_mask"]  # (B, L2)
 
         #Cross-attention hai chiều
@@ -261,9 +265,9 @@ class SmilesOnlyDDIModel(nn.Module):
 
         prod = z1 * z2
         diff = torch.abs(z1 - z2)
-        z_pair = torch.cat([z1, z2, prod, diff], dim=-1)
+        z_pair = torch.cat([z1, z2, prod, diff], dim=-1)  #input vector : [z1, z2, z1*z2, |z1−z2|]
 
-        logits = self.classifier(z_pair)
+        logits = self.classifier(z_pair) #multi_class prediction
 
         if labels is None:
             return logits, torch.tensor(0.0, device=logits.device)
@@ -271,10 +275,10 @@ class SmilesOnlyDDIModel(nn.Module):
         # CE loss
         ce_loss = F.cross_entropy(logits, labels)
 
-        k = 16
+        k = 16 #top 16 substructure drug
 
         all_motifs = []
-        all_motif_labels = []
+        all_motif_labels = [] #tạo motif cho các substructure
 
         B = labels.size(0)
 
@@ -283,7 +287,7 @@ class SmilesOnlyDDIModel(nn.Module):
             valid1 = m1[b].bool()
             valid2 = m2[b].bool()
 
-            # attention sample b
+            # attention sample b-th
             attn_ab_b = attn_ab[b]  # (heads, L1, L2)
             attn_ba_b = attn_ba[b]  # (heads, L2, L1)
 
@@ -294,7 +298,7 @@ class SmilesOnlyDDIModel(nn.Module):
             imp1 = imp1[valid1]
             imp2 = imp2[valid2]
 
-            # get indices in the original H1_att
+            # get k-indices in the original H1_att
             idx1 = torch.topk(imp1, min(k, imp1.size(0))).indices
             idx2 = torch.topk(imp2, min(k, imp2.size(0))).indices
 
@@ -304,11 +308,11 @@ class SmilesOnlyDDIModel(nn.Module):
             all_motifs.append(h1_tokens)
             all_motifs.append(h2_tokens)
 
-            lab = labels[b].repeat(h1_tokens.size(0) + h2_tokens.size(0))
-            all_motif_labels.append(lab)
+            lab = labels[b].repeat(h1_tokens.size(0) + h2_tokens.size(0)) #Tạo nhãn cho các token của 2 thuốc
+            all_motif_labels.append(lab) # Nhận tất cả index của substructure
 
-        all_motifs = torch.cat(all_motifs, dim=0)
-        all_motif_labels = torch.cat(all_motif_labels, dim=0)
+        all_motifs = torch.cat(all_motifs, dim=0) #M = tổng số motifs của toàn batch, D = embedding dimension
+        all_motif_labels = torch.cat(all_motif_labels, dim=0) #Nhãn cho từng motif
 
         supcon = supervised_contrastive_loss(
             all_motifs, all_motif_labels, temperature=0.1
