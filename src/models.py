@@ -182,6 +182,22 @@ def supervised_contrastive_loss(
     loss = -mean_log_prob_pos
     return loss
 
+class Get3DConformer(nn.Module):
+    """
+    Get embedding conformer from pretrained model Uni-Mol
+    """
+    def __init__(
+        self,
+        nodel_name: str,
+        num_class: int = 86,
+        subfolder: Optional[str] = None,
+        d_model: int = 512,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        freeze_encoder: bool = True,
+    ):
+        super().__init__()
+
 
 class SmilesOnlyDDIModel(nn.Module):
     """

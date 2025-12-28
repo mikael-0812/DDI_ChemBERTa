@@ -20,15 +20,20 @@ drug_dict = pd.read_csv("dataset/drugbank/drug_smiles.csv")
 id2smiles = dict(zip(drug_dict['drug_id'], drug_dict['smiles']))
 
 model_name = "ndlong/mm-dti"
-subfolder = "ChemBERTa"
+subfolder_smiles = "ChemBERTa"
+subfolder_unimol = "Uni-Mol"
 
 model = SmilesOnlyDDIModel(
     model_name=model_name,
     lambda_supcon=0.1,
-    subfolder=subfolder,
+    subfolder=subfolder_smiles,
     num_classes=86,
     freeze_encoder=True,
 ).to(device)
+
+# uni_mol_extract = 3D_Conformer(
+#
+# )
 
 tokenizer = model.tokenizer
 
