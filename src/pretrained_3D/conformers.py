@@ -7,6 +7,7 @@ from __future__ import absolute_import, division, print_function
 import os
 import pandas as pd
 import numpy as np
+import torch
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -67,34 +68,42 @@ class ConformerGen(object):
                        These can include the random seed, maximum number of atoms, data type,
                        generation method, generation mode, and whether to remove hydrogens.
         """
-        self.seed = params.get('seed', 42)
+        self.seed = params.get('seed', 33)
         self.max_atoms = params.get('max_atoms', 256)
         self.data_type = params.get('data_type', 'molecule')
         self.method = params.get('method', 'rdkit_random')
         self.mode = params.get('mode', 'fast')
         self.remove_hs = params.get('remove_hs', False)
         self.unimol_dir = params.get('unimol_dir', '')
-        if self.data_type == 'molecule':
-            name = "no_h" if self.remove_hs else "all_h"
-            name = self.data_type + '_' + name
-            self.dict_name = MODEL_CONFIG['dict'][name]
-        else:
-            self.dict_name = MODEL_CONFIG['dict'][self.data_type]
-        self.dictionary = Dictionary.load(os.path.join(os.path.dirname(self.unimol_dir), 'mol.dict.txt'))
-        self.dictionary.add_symbol("[MASK]", is_special=True)
-        print('ConformerGen initialized with method: {}, seed: {}, max_atoms: {}, remove_hs: {}'.format(self.method, self.seed, self.max_atoms, self.remove_hs))
+        self.dictionary = None
+        self.output_model = params.get('output_model', 'unimol')
+
+        if self.output_model == 'unimol':
+            if self.data_type == 'molecule':
+                name = "no_h" if self.remove_hs else "all_h"
+                name = self.data_type + '_' + name
+                self.dict_name = MODEL_CONFIG['dict'][name]
+            else:
+                self.dict_name = MODEL_CONFIG['dict'][self.data_type]
+            self.dictionary = Dictionary.load(os.path.join(os.path.dirname(self.unimol_dir), 'mol.dict.txt'))
+            self.dictionary.add_symbol("[MASK]", is_special=True)
+            print('ConformerGen initialized with method: {}, seed: {}, max_atoms: {}, remove_hs: {}'.format(self.method, self.seed, self.max_atoms, self.remove_hs))
 
     def single_process(self, smiles):
         """
         Processes a single SMILES string to generate conformers using the specified method.
 
         :param smiles: (str) The SMILES string representing the molecule.
-        :return: A unimolecular data representation (dictionary) of the molecule.
+        :return A unimolecular data representation (dictionary) of the molecule.
         :raises ValueError: If the conformer generation method is unrecognized.
         """
         if self.method == 'rdkit_random':
             atoms, coordinates = inner_smi2coords(smiles, seed=self.seed, mode=self.mode, remove_hs=self.remove_hs)
-            return coords2unimol(atoms, coordinates, self.dictionary, self.max_atoms, remove_hs=self.remove_hs)
+
+            if self.output_model == 'unimol':
+                return coords2unimol(atoms, coordinates, self.dictionary, self.max_atoms, remove_hs=self.remove_hs)
+            else:
+                return atoms, coordinates
         else:
             raise ValueError('Unknown conformer generation method: {}'.format(self.method))
 
@@ -105,16 +114,63 @@ class ConformerGen(object):
             inputs.append(coords2unimol(atoms, coordinates, self.dictionary, self.max_atoms, remove_hs=self.remove_hs))
         return inputs
 
-    def transform(self, smiles_list):
-        pool = Pool()
-        print('Start generating conformers...')
-        inputs = [item for item in tqdm(pool.imap(self.single_process, smiles_list))]
-        pool.close()
-        failed_cnt = np.mean([(item['src_coord'] == 0.0).all() for item in inputs])
-        print('Failed to generate conformers for {:.2f}% of molecules.'.format(failed_cnt*100))
-        failed_3d_cnt = np.mean([(item['src_coord'][:, 2] == 0.0).all() for item in inputs])
-        print('Failed to generate 3d conformers for {:.2f}% of molecules.'.format(failed_3d_cnt*100))
-        return inputs
+    def transform(self, smiles_list, ids=None, save_path=None):
+        """
+        :param smiles_list:
+        :param ids:
+                - None : uses index 0...len-1
+                - list : id of SMILES in dataset
+        :param save_path:
+        :return:
+            if self.output_model == 'unimol' : return list[dict] with keys src_tokens/src_coord/src_distance/src_edge_type
+            if self.output_model == 'raw' : return dict[id -> {'smiles', 'atoms', 'confs'}]
+        """
+
+        if ids is None:
+            ids = list(range(len(smiles_list)))
+        assert (len(ids) == len(smiles_list))
+
+        if self.output_model == 'unimol':
+            pool = Pool()
+            print('Start generating conformers...')
+            inputs = [item for item in tqdm(pool.imap(self.single_process, smiles_list))]
+            pool.close()
+            failed_cnt = np.mean([(item['src_coord'] == 0.0).all() for item in inputs])
+            print('Failed to generate conformers for {:.2f}% of molecules.'.format(failed_cnt*100))
+            failed_3d_cnt = np.mean([(item['src_coord'][:, 2] == 0.0).all() for item in inputs])
+            print('Failed to generate 3d conformers for {:.2f}% of molecules.'.format(failed_3d_cnt*100))
+            return inputs
+
+        else:
+            pool = Pool()
+            print('Start generating conformers...')
+            results = list(tqdm(pool.imap(self.single_process, smiles_list), total=len(smiles_list)))
+            pool.close()
+            raw_obj = {}
+            failed = {}
+
+            for k, smiles, (atoms, coordinates) in zip(ids, smiles_list, results):
+                coords = np.asarray(coordinates, dtype=np.float32)
+
+                if coords.ndim != 2 or coords.shape[1] != 3:
+                    failed[int(k)] = 'bad_shape'
+                    # continue
+
+                if np.all(coords == 0.0):
+                    failed[int(k)] = 'all_zeros'
+                    # continue
+
+                if np.all(coords[:, 2] == 0.0):
+                    failed[int(k)] = 'z_all_zeros'
+                    # continue
+
+                raw_obj[int(k)] = {'smiles': smiles, 'atoms': atoms, 'confs': coordinates}
+
+            if save_path is not None:
+                torch.save(raw_obj, save_path)
+                torch.save(failed, save_path.replace(".pt", "_raw_failed.pt"))
+
+            return raw_obj
 
 
 def inner_smi2coords(smi, seed=33, mode='fast', remove_hs=False):
@@ -283,5 +339,26 @@ def coords2unimol_mof(atoms, coordinates, dictionary, max_atoms=256):
 
 
 if __name__ == '__main__':
-    pass
+    data = pd.read_csv('../data/id_map.csv')
+    smiles_list = data['smiles'].tolist()
+    idx = data['idx'].tolist()
+
+    gen = ConformerGen(
+        seed = 33,
+        max_atoms = 256,
+        data_type = 'molecule',
+        method = 'rdkit_random',
+        mode = 'fast',
+        remove_hs = False,
+        unimol_dir = 'unimol_dir',
+        dictionary = None,
+        output_model = 'raw'
+    )
+
+    raw_output = gen.transform(
+        smiles_list = smiles_list,
+        ids = idx,
+        save_path='/content/raw_confs.pt'
+    )
+
 
