@@ -4,7 +4,7 @@ from random import random
 import numpy as np
 from rdkit import Chem
 
-from src.pretrained_3D.utils import is_all_zeros, is_z_all_zeros
+from utils import is_all_zeros, is_z_all_zeros
 
 pt = Chem.GetPeriodicTable()
 
@@ -30,8 +30,8 @@ class PT3DDataset(Dataset):
         save_valid_ids: str = None,
     ):
         super().__init__()
-        random.seed(seed)
-        np.random.seed(seed)
+        # random.seed(seed)
+        # np.random.seed(seed)
 
         self.obj = torch.load(pt_path, map_location='cpu')
         self.keys_all = sorted([int(k) for k in self.obj.keys()])
@@ -93,14 +93,14 @@ class PT3DDataset(Dataset):
         k = self.valid_keys[idx]
         entry = self.obj[k]
         atoms = entry.get("atoms", None)
-        coords = np.asarray(entry["atoms"], dtype=np.float32)
+        coords = np.asarray(entry["confs"], dtype=np.float32)
         smiles = entry.get("smiles", "")
 
         return {
             "idx": int(k),
             "smiles": smiles,
             "atoms": atoms,
-            "confs": np.asarray(entry["confs"], dtype=np.float32),
+            "confs": coords,
         }
 
 

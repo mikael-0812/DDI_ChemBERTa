@@ -67,7 +67,7 @@ def train_contrastive_from_pt(
     pt_path,
     egnn,
     atoms_to_Z,
-    collate_fn,                 # your collate_views_rdkit_bonds(...)
+    collate_fn,
     out_ckpt="/content/pretrained_egnn_contrastive.pt",
     batch_size=32,
     epochs=50,
@@ -99,7 +99,14 @@ def train_contrastive_from_pt(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ds = PT3DDataset(pt_path, drop_all_zero=drop_all_zero, drop_z_all_zero=drop_z_all_zero)
+    ds = PT3DDataset(pt_path,
+        remove_multifragment = False, # salts/ions multi-fragments
+        min_atoms = 3, # removes drug molecules including only salts and metal ions
+        max_atoms = 256,
+        drop_all_zeros = True,
+        drop_z_all_zeros = False,
+        seed = 33,
+        save_valid_ids = None)
     loader = DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers,
                         collate_fn=lambda b: b, pin_memory=(device.startswith("cuda")))
 
@@ -108,7 +115,6 @@ def train_contrastive_from_pt(
     opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scaler = torch.cuda.amp.GradScaler(enabled=(amp and device.startswith("cuda")))
 
-    # simple stats
     print(f"Loaded dataset: {len(ds)} molecules from {pt_path}")
     print(f"Device: {device} | AMP: {scaler.is_enabled()}")
     print(f"Saving to: {out_ckpt}")
@@ -120,9 +126,8 @@ def train_contrastive_from_pt(
         kept_batches = 0
 
         for batch in loader:
-            step += 1
 
-            # build two views using your collate (RDKit bond edges, no RBF)
+            step += 1
             try:
                 v1, v2, ids = collate_fn(
                     batch,
@@ -131,7 +136,9 @@ def train_contrastive_from_pt(
                 )
             except Exception as ex:
                 # batch could become empty after filtering inside collate
-                continue
+              print("COLLATE FAIL:", type(ex).__name__, str(ex)[:200])
+              continue
+
 
             Z1, x1, e1, ea1, b1 = v1
             Z2, x2, e2, ea2, b2 = v2
@@ -159,14 +166,14 @@ def train_contrastive_from_pt(
             losses.append(float(loss.item()))
             kept_batches += 1
 
-            if log_every and (kept_batches % log_every == 0):
-                avg = sum(losses[-log_every:]) / max(1, len(losses[-log_every:]))
-                print(f"[ep {ep:03d}/{epochs}] batch {kept_batches:04d} | loss {avg:.4f} | B={B}")
+            # if log_every and (kept_batches % log_every == 0):
+            #     avg = sum(losses[-log_every:]) / max(1, len(losses[-log_every:]))
+            #     print(f"[ep {ep:03d}/{epochs}] batch {kept_batches:04d} | loss {avg:.4f} | B={B}")
 
         ep_loss = sum(losses) / max(1, len(losses))
         print(f"Epoch {ep}/{epochs} - mean loss: {ep_loss:.4f} | used_batches={kept_batches}")
 
-        # save every epoch (safe for Colab)
+        # save every epoch
         ckpt = {
             "epoch": ep,
             "encoder": model.state_dict(),
@@ -286,7 +293,6 @@ def export_embeddings_from_pt_with_contrastive_encoder(
         h0 = encoder_model.atom_emb(Z_cat)                         # [total_nodes, atom_emb_dim]
         h, _ = encoder_model.egnn(h0, x_cat, e_cat, edge_attr=None)  # [total_nodes, out_node_nf]
 
-        # mean pool theo batch index
         B = int(b_cat.max().item()) + 1
         hdim = h.size(1)
         sum_h = h.new_zeros((B, hdim))

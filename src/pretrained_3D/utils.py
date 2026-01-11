@@ -2,8 +2,8 @@ import math
 
 import numpy as np
 import torch
-from typing import Dict, Any, Tuple
-
+from typing import Dict, Any
+from collections import Counter
 from numpy import bool_
 from rdkit import Chem
 
@@ -89,19 +89,12 @@ def one_hot(x, choices):
         out[choices.index(x)] = 1.0
     return out
 
-def build_bond_graph_rdkit(smiles: str, device="cpu"):
-    """
-    Returns:
-      edges: (2, E) long
-      edge_attr: (E, 13) float
-    Notes:
-      - directed edges (i->j and j->i)
-      - no self-loops
-      - edge_attr does NOT depend on coords (no RBF)
-    """
+def build_bond_graph_rdkit(smiles: str, device="cuda"):
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Bad SMILES: {smiles}")
+
+    mol = Chem.AddHs(mol)
 
     bond_types = [
         Chem.rdchem.BondType.SINGLE,
@@ -130,17 +123,23 @@ def build_bond_graph_rdkit(smiles: str, device="cpu"):
         f += [float(b.GetIsConjugated())]                 # 1
         f += [float(b.IsInRing())]                        # 1
         f += one_hot(b.GetStereo(), stereo_types)         # 6
-        assert len(f) == 13
 
-        # both directions
+        if len(f) != 13:
+            raise RuntimeError(f"edge_attr dim != 13 for smiles={smiles}")
+
         rows += [i, j]
         cols += [j, i]
         feats += [f, f]
 
+    if len(rows) == 0:
+        edges = torch.zeros((2, 0), dtype=torch.long, device=device)
+        edge_attr = torch.zeros((0, 13), dtype=torch.float32, device=device)
+        return edges, edge_attr, mol.GetNumAtoms()
+
     edges = torch.tensor([rows, cols], dtype=torch.long, device=device)
     edge_attr = torch.tensor(feats, dtype=torch.float32, device=device)
-
     return edges, edge_attr, mol.GetNumAtoms()
+
 
 def drop_edges(edges, edge_attr, drop_p=0.1):
     """
@@ -161,99 +160,92 @@ def drop_edges(edges, edge_attr, drop_p=0.1):
 def collate_views_rdkit_bonds(
     batch,
     atoms_to_Z,
-    device="cuda",
+    device='cuda',
     rotate=True,
     noise_std=0.02,
     edge_drop=0.1,
-    drop_if_no_bonds=True,
+    drop_if_no_bonds=False,
+    r_cut=4.5,
 ):
-    """
-    batch: list[entry dict]
-    returns:
-      (Z1, x1, e1, ea1, b1), (Z2, x2, e2, ea2, b2), ids
-    where:
-      Z: (total_nodes,)
-      x: (total_nodes,3)
-      edges: (2,total_edges)
-      edge_attr: (total_edges,13)
-      batch_idx: (total_nodes,)
-    """
-    Z1_list, x1_list, b1_list = [], [], []
-    e1_list, ea1_list = [], []
-
-    Z2_list, x2_list, b2_list = [], [], []
-    e2_list, ea2_list = [], []
+    Z1_list, x1_list, b1_list, e1_list, ea1_list = [], [], [], [], []
+    Z2_list, x2_list, b2_list, e2_list, ea2_list = [], [], [], [], []
 
     ids = []
     node_offset = 0
     mol_idx = 0
+    drop = Counter()
 
     for entry in batch:
-        smiles = entry["smiles"]
-        atoms = entry["atoms"]
-        coords = entry["confs"]  # (N,3)
+        smiles = entry.get("smiles", None)
+        atoms  = entry.get("atoms", None)
+        coords = entry.get("confs", None)
 
-        # coords -> torch
-        x0 = torch.tensor(np.asarray(coords), dtype=torch.float32, device=device)
-        Z0 = torch.tensor(atoms_to_Z(atoms), dtype=torch.long, device=device)
-
-        # sanity: atom count must match
-        if x0.size(0) != Z0.size(0):
-            # skip sample
+        if smiles is None or atoms is None:
+            drop["missing_smiles_or_atoms"] += 1
             continue
 
-        # build rdkit bond edges + edge_attr (constant across views)
+
+        x0 = torch.tensor(coords, dtype=torch.float32, device=device)
+        Z0 = torch.tensor(atoms_to_Z(atoms), dtype=torch.long, device=device)
+
+        if x0.ndim != 2 or x0.size(1) != 3:
+            drop["coords_not_Nx3"] += 1
+            continue
+
+        if x0.size(0) != Z0.size(0):
+            drop["atom_count_mismatch_atoms_vs_coords"] += 1
+            continue
+
+        # build bond graph with RemoveHs
         try:
             edges0, edge_attr0, n_atoms_mol = build_bond_graph_rdkit(smiles, device=device)
         except Exception:
+            drop["rdkit_parse_or_bond_fail"] += 1
             continue
 
-        # extra sanity: rdkit atom count should match coords
         if n_atoms_mol != x0.size(0):
+            drop["atom_count_mismatch_rdkit_vs_coords"] += 1
             continue
 
-        # handle no bonds (ions/atoms)
+        # if no bonds -> fallback radius
         if edges0.size(1) == 0:
             if drop_if_no_bonds:
+                drop["no_bonds_dropped"] += 1
                 continue
-            # else: keep empty edges; EGNN may behave poorly if totally isolated
+            # radius fallback
+            # edges0 = build_radius_graph_torch(x0, r_cut=r_cut)  # (2,E)
+            # if edges0.size(1) == 0:
+            #     drop["radius_no_edges"] += 1
+            #     continue
+            # edge_attr0 = radius_edge_attr_13(x0, edges0)
 
-        # make two views of coords
+        # augment coords
         x1 = augment_coords(x0, rotate=rotate, noise_std=noise_std)
         x2 = augment_coords(x0, rotate=rotate, noise_std=noise_std)
 
-        # optional edge dropout per view (edges & edge_attr must be dropped together)
+        # edge dropout
         e1, ea1 = drop_edges(edges0, edge_attr0, drop_p=edge_drop)
         e2, ea2 = drop_edges(edges0, edge_attr0, drop_p=edge_drop)
 
-        # offset edges for batch packing
-        if e1.size(1) > 0:
-            e1 = e1 + node_offset
-        if e2.size(1) > 0:
-            e2 = e2 + node_offset
+        if e1.size(1) > 0: e1 = e1 + node_offset
+        if e2.size(1) > 0: e2 = e2 + node_offset
 
-        # append
         n = x0.size(0)
-        Z1_list.append(Z0)
-        x1_list.append(x1)
+        Z1_list.append(Z0); x1_list.append(x1)
         b1_list.append(torch.full((n,), mol_idx, dtype=torch.long, device=device))
-        e1_list.append(e1)
-        ea1_list.append(ea1)
+        e1_list.append(e1); ea1_list.append(ea1)
 
-        Z2_list.append(Z0)
-        x2_list.append(x2)
+        Z2_list.append(Z0); x2_list.append(x2)
         b2_list.append(torch.full((n,), mol_idx, dtype=torch.long, device=device))
-        e2_list.append(e2)
-        ea2_list.append(ea2)
+        e2_list.append(e2); ea2_list.append(ea2)
 
-        ids.append(entry.get("idx", None))
+        ids.append(entry.get("idx", mol_idx))
 
         node_offset += n
         mol_idx += 1
 
-    # concat all
     if mol_idx == 0:
-        raise RuntimeError("No valid molecules in this batch after filtering.")
+        raise RuntimeError(f"No valid molecules in this batch after filtering. drop_stats={dict(drop)}")
 
     Z1 = torch.cat(Z1_list, dim=0)
     x1 = torch.cat(x1_list, dim=0)
@@ -268,4 +260,3 @@ def collate_views_rdkit_bonds(
     ea2 = torch.cat(ea2_list, dim=0) if len(ea2_list) else torch.zeros((0,13), dtype=torch.float32, device=device)
 
     return (Z1, x1, e1, ea1, b1), (Z2, x2, e2, ea2, b2), ids
-
