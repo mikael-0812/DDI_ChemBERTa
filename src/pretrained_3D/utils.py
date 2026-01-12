@@ -260,3 +260,117 @@ def collate_views_rdkit_bonds(
     ea2 = torch.cat(ea2_list, dim=0) if len(ea2_list) else torch.zeros((0,13), dtype=torch.float32, device=device)
 
     return (Z1, x1, e1, ea1, b1), (Z2, x2, e2, ea2, b2), ids
+
+def fixed_rotations(device="cpu", dtype=torch.float32):
+    # 90 deg around x
+    Rx = torch.tensor([[1,0,0],
+                       [0,0,-1],
+                       [0,1,0]], device=device, dtype=dtype)
+    # 90 deg around y
+    Ry = torch.tensor([[0,0,1],
+                       [0,1,0],
+                       [-1,0,0]], device=device, dtype=dtype)
+    return Rx, Ry
+
+def apply_rot(x, R):
+    # x: (N,3), R: (3,3)
+    return x @ R.T
+
+def collate_views_rdkit_bonds_val(
+    batch,
+    atoms_to_Z,
+    device="cuda",
+    drop_if_no_bonds=True,
+):
+    """
+    Deterministic validation:
+    - no noise
+    - no edge_drop
+    - fixed rotations for view1/view2
+    """
+    Z1_list, x1_list, b1_list = [], [], []
+    e1_list, ea1_list = [], []
+    Z2_list, x2_list, b2_list = [], [], []
+    e2_list, ea2_list = [], []
+    ids = []
+
+    node_offset = 0
+    mol_idx = 0
+
+    # fixed rotations (deterministic)
+    Rx, Ry = fixed_rotations(device=device, dtype=torch.float32)
+
+    for entry in batch:
+        smiles = entry["smiles"]
+        atoms = entry["atoms"]
+        coords = entry["confs"]  # (N,3)
+
+        x0 = torch.tensor(np.asarray(coords), dtype=torch.float32, device=device)
+        Z0 = torch.tensor(atoms_to_Z(atoms), dtype=torch.long, device=device)
+
+        # sanity: atom count must match
+        if x0.size(0) != Z0.size(0):
+            continue
+
+        # build rdkit bond edges + edge_attr
+        try:
+            edges0, edge_attr0, n_atoms_mol = build_bond_graph_rdkit(smiles, device=device)
+        except Exception:
+            continue
+
+        if n_atoms_mol != x0.size(0):
+            continue
+
+        if edges0.size(1) == 0 and drop_if_no_bonds:
+            continue
+
+        # center coords (recommended)
+        x0 = x0 - x0.mean(dim=0, keepdim=True)
+
+        # deterministic 2 views
+        x1 = apply_rot(x0, Rx)
+        x2 = apply_rot(x0, Ry)
+
+        # no edge_drop in val => same edges/attrs
+        e1, ea1 = edges0, edge_attr0
+        e2, ea2 = edges0, edge_attr0
+
+        # offset edges for packing
+        if e1.size(1) > 0:
+            e1 = e1 + node_offset
+            e2 = e2 + node_offset
+
+        n = x0.size(0)
+        Z1_list.append(Z0)
+        x1_list.append(x1)
+        b1_list.append(torch.full((n,), mol_idx, dtype=torch.long, device=device))
+        e1_list.append(e1)
+        ea1_list.append(ea1)
+
+        Z2_list.append(Z0)
+        x2_list.append(x2)
+        b2_list.append(torch.full((n,), mol_idx, dtype=torch.long, device=device))
+        e2_list.append(e2)
+        ea2_list.append(ea2)
+
+        ids.append(entry.get("idx", None))
+
+        node_offset += n
+        mol_idx += 1
+
+    if mol_idx == 0:
+        raise RuntimeError("No valid molecules in this batch after filtering (val).")
+
+    Z1 = torch.cat(Z1_list, dim=0)
+    x1 = torch.cat(x1_list, dim=0)
+    b1 = torch.cat(b1_list, dim=0)
+    e1 = torch.cat(e1_list, dim=1) if len(e1_list) else torch.zeros((2,0), dtype=torch.long, device=device)
+    ea1 = torch.cat(ea1_list, dim=0) if len(ea1_list) else torch.zeros((0,13), dtype=torch.float32, device=device)
+
+    Z2 = torch.cat(Z2_list, dim=0)
+    x2 = torch.cat(x2_list, dim=0)
+    b2 = torch.cat(b2_list, dim=0)
+    e2 = torch.cat(e2_list, dim=1) if len(e2_list) else torch.zeros((2,0), dtype=torch.long, device=device)
+    ea2 = torch.cat(ea2_list, dim=0) if len(ea2_list) else torch.zeros((0,13), dtype=torch.float32, device=device)
+
+    return (Z1, x1, e1, ea1, b1), (Z2, x2, e2, ea2, b2), ids
