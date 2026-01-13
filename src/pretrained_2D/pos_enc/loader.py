@@ -316,12 +316,11 @@ class MoleculeDataset_Eig_v2(InMemoryDataset):
         csv_path = self.raw_paths[0]
         df = pd.read_csv(csv_path)
 
-        # bạn có thể đổi tên cột nếu file bạn dùng khác
-        assert "drug_id" in df.columns and "SMILES" in df.columns, \
-            "CSV must have columns: drug_id, SMILES"
+        assert "drug_id" in df.columns and "smiles" in df.columns, \
+            "CSV must have columns: drug_id, smiles"
 
-        drug_ids = df["drug_id"].astype(str).tolist()
-        smiles_list = df["SMILES"].astype(str).tolist()
+        drug_ids = df["idx"].astype(str).tolist()
+        smiles_list = df["smiles"].astype(str).tolist()
 
         data_list = []
         smiles_ok = []
@@ -335,14 +334,10 @@ class MoleculeDataset_Eig_v2(InMemoryDataset):
                     continue
 
                 data = mol_to_graph_data_obj_simple(mol)  # must set data.x, data.edge_index, data.edge_attr
-                # id: nên lưu integer để tiện (PyTorch tensor)
-                data.id = torch.tensor([i], dtype=torch.long)   # internal index
-                # (tuỳ chọn) nếu bạn muốn label khác thì add vào đây
 
                 data_list.append(data)
                 smiles_ok.append(smi)
-                id_ok.append(did)
-                idx_ok.append(i)
+                idx_ok.append(did)
             except Exception:
                 continue
 
@@ -356,8 +351,7 @@ class MoleculeDataset_Eig_v2(InMemoryDataset):
             index=False, header=False
         )
 
-        # save mapping drug_id <-> internal idx (rất nên có)
-        pd.DataFrame({"idx": idx_ok, "drug_id": id_ok, "SMILES": smiles_ok}).to_csv(
+        pd.DataFrame({"idx": idx_ok, "smiles": smiles_ok}).to_csv(
             os.path.join(self.processed_dir, "id_map.csv"),
             index=False
         )

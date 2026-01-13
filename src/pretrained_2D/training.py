@@ -7,7 +7,7 @@ import torch.optim as optim
 import utils
 from tqdm import tqdm
 from model import TokenMAE
-from src.pos_enc.loader import MoleculeDataset_Eig_v2
+from pos_enc.loader import MoleculeDataset_Eig_v2
 
 
 def train_mae(args, model, loader, optimizer, epoch):
@@ -86,8 +86,8 @@ def main():
 
 
     dataset = MoleculeDataset_Eig_v2(
-        root="data/raw",
-        csv_name="drug_smiles.csv"
+        root="data",
+        csv_name="train_id.csv"
     )
 
     if args.subset:

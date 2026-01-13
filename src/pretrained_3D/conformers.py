@@ -73,7 +73,7 @@ class ConformerGen(object):
         self.data_type = params.get('data_type', 'molecule')
         self.method = params.get('method', 'rdkit_random')
         self.mode = params.get('mode', 'fast')
-        self.remove_hs = params.get('remove_hs', False)
+        self.remove_hs = params.get('remove_hs', True)
         self.unimol_dir = params.get('unimol_dir', '')
         self.dictionary = None
         self.output_model = params.get('output_model', 'unimol')
@@ -173,7 +173,7 @@ class ConformerGen(object):
             return raw_obj
 
 
-def inner_smi2coords(smi, seed=33, mode='fast', remove_hs=False):
+def inner_smi2coords(smi, seed=33, mode='fast', remove_hs=True):
     '''
     This function is responsible for converting a SMILES (Simplified Molecular Input Line Entry System) string into 3D coordinates for each atom in the molecule. It also allows for the generation of 2D coordinates if 3D conformation generation fails, and optionally removes hydrogen atoms and their coordinates from the resulting data.
 
@@ -349,7 +349,7 @@ if __name__ == '__main__':
         data_type = 'molecule',
         method = 'rdkit_random',
         mode = 'fast',
-        remove_hs = False,
+        remove_hs = True,
         unimol_dir = 'unimol_dir',
         dictionary = None,
         output_model = 'raw'
