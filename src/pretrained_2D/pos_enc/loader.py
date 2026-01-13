@@ -253,6 +253,14 @@ def get_largest_mol(mol_list):
     largest_mol_idx = num_atoms_list.index(max(num_atoms_list))
     return mol_list[largest_mol_idx]
 
+def heavy_symbols_from_mol(mol):
+    if mol is None:
+        return None
+    heavy = Chem.RemoveHs(mol)
+    Chem.SanitizeMol(heavy)
+    print(type(heavy))
+    return heavy
+
 def get_gasteiger_partial_charges(mol, n_iter=12):
     """
     Calculates list of gasteiger partial charges for each atom in mol object.
@@ -333,6 +341,8 @@ class MoleculeDataset_Eig_v2(InMemoryDataset):
                 if mol is None:
                     continue
 
+                mol = heavy_symbols_from_mol(mol)
+
                 data = mol_to_graph_data_obj_simple(mol)  # must set data.x, data.edge_index, data.edge_attr
 
                 data_list.append(data)
@@ -341,11 +351,9 @@ class MoleculeDataset_Eig_v2(InMemoryDataset):
             except Exception:
                 continue
 
-        # pre_transform (nếu bạn cần)
         if self.pre_transform is not None:
             data_list = [self.pre_transform(d) for d in data_list]
 
-        # save smiles.csv để đồng bộ với style repo
         pd.Series(smiles_ok).to_csv(
             os.path.join(self.processed_dir, "smiles.csv"),
             index=False, header=False

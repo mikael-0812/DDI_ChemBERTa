@@ -94,7 +94,7 @@ def build_bond_graph_rdkit(smiles: str, device="cuda"):
     if mol is None:
         raise ValueError(f"Bad SMILES: {smiles}")
 
-    # mol = Chem.AddHs(mol)
+    mol = Chem.RemoveHs(mol)
 
     bond_types = [
         Chem.rdchem.BondType.SINGLE,
